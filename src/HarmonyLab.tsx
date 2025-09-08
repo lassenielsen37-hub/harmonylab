@@ -98,7 +98,11 @@ export default function HarmonyLab() {
   const [scale, setScale] = useState<string>("Major");
   const [fileName, setFileName] = useState<string>("");
 
+  // Mic device selection
   const micRef = useRef<Tone.UserMedia | null>(null);
+  const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedMicId, setSelectedMicId] = useState<string>("");
+
   const playerRef = useRef<Tone.Player | null>(null);
 
   // Audio graph
@@ -169,11 +173,36 @@ export default function HarmonyLab() {
 
   const initAudio = async () => { await Tone.start(); setStatus("ready"); };
 
+  const refreshMicDevices = async () => {
+    if (!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices)) return;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    setMicDevices(devices.filter((d) => d.kind === "audioinput"));
+  };
+
+  useEffect(() => {
+    if (!navigator.mediaDevices?.addEventListener) return;
+    const onChange = () => refreshMicDevices();
+    navigator.mediaDevices.addEventListener("devicechange", onChange);
+    return () => navigator.mediaDevices.removeEventListener("devicechange", onChange);
+  }, []);
+
+  useEffect(() => {
+    if (status === "live" && micRef.current) {
+      try { stopMic(); } catch {}
+      startMic();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedMicId]);
+
   const startMic = async () => {
     await initAudio();
+    const constraints: MediaStreamConstraints = selectedMicId
+      ? { audio: { deviceId: { exact: selectedMicId } }, video: false }
+      : { audio: true, video: false };
     const mic = new Tone.UserMedia();
-    await mic.open();
+    await mic.open(constraints);
     micRef.current = mic; attachNode(mic); setStatus("live");
+    try { await refreshMicDevices(); } catch {}
   };
   const stopMic = () => {
     const mic = micRef.current; if (mic) { detachNode(mic); mic.close(); mic.dispose(); micRef.current = null; }
@@ -211,6 +240,10 @@ export default function HarmonyLab() {
   const tickRef = useRef<number | null>(null);
   const recStartRef = useRef<number | null>(null);
 
+  // Preview element + blob URL cleanup
+  const audioPreviewRef = useRef<HTMLAudioElement | null>(null);
+  const lastBlobUrlRef = useRef<string | null>(null);
+
   // Mute monitoring while recording to avoid feedback
   useEffect(() => {
     try { monitorGain.gain.value = (isRec && muteDuringRec) ? 0 : 1; } catch {}
@@ -227,6 +260,7 @@ export default function HarmonyLab() {
     try { recorderRef.current?.stop(); } catch {}
     try { if (recorderRef.current) bus.disconnect(recorderRef.current); } catch {}
     recorderRef.current?.dispose(); recorderRef.current = null;
+    if (lastBlobUrlRef.current) { try { URL.revokeObjectURL(lastBlobUrlRef.current); } catch {} }
   }, [bus]);
 
   const showToast = (msg: string, ttl = 2500) => {
@@ -240,6 +274,9 @@ export default function HarmonyLab() {
     if (isRec || isStartingRec || recStatusRef.current === "recording") return; // guard double start
     const hasInput = !!micRef.current || !!playerRef.current;
     if (!hasInput) { showToast("Start mikrofon eller afspil en fil først."); return; }
+
+    // stop any preview playback
+    try { audioPreviewRef.current?.pause(); } catch {}
 
     setIsStartingRec(true); setDownloadUrl(null);
     try {
@@ -258,7 +295,13 @@ export default function HarmonyLab() {
     recStatusRef.current = "stopping"; showToast("Stopper og gemmer…");
     try {
       const blob = await recorderRef.current?.stop();
-      if (blob) { setDownloadUrl(URL.createObjectURL(blob)); showToast("Optagelse klar – klik Download mix.", 4000); }
+      if (blob) {
+        const url = URL.createObjectURL(blob);
+        if (lastBlobUrlRef.current) { try { URL.revokeObjectURL(lastBlobUrlRef.current); } catch {} }
+        lastBlobUrlRef.current = url;
+        setDownloadUrl(url);
+        showToast("Optagelse klar – klik Download mix.", 4000);
+      }
     } catch (e) { showToast("Kunne ikke stoppe optagelse.", 4000); }
     finally {
       recStatusRef.current = "idle"; setIsRec(false);
@@ -317,31 +360,54 @@ export default function HarmonyLab() {
       <section className="grid md:grid-cols-2 gap-6">
         <div className="space-y-4 p-4 rounded-2xl border bg-white">
           <h2 className="font-semibold">Kilde</h2>
-          <div className="flex gap-2 items-center">
-            <Button className={sourceMode === "mic" ? "bg-black text-white" : ""} onClick={() => setSourceMode("mic")}>Mikrofon</Button>
-            <Button className={sourceMode === "file" ? "bg-black text-white" : ""} onClick={() => setSourceMode("file")}>Upload fil</Button>
-            <div className="md:hidden ml-auto"><Pot value={inputLevel} label="Input" /></div>
-          </div>
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button className={sourceMode === "mic" ? "bg-black text-white" : ""} onClick={() => setSourceMode("mic")}>Mikrofon</Button>
+              <Button className={sourceMode === "file" ? "bg-black text-white" : ""} onClick={() => setSourceMode("file")}>Upload fil</Button>
+              <div className="md:hidden ml-auto"><Pot value={inputLevel} label="Input" /></div>
+            </div>
 
-          {sourceMode === "mic" ? (
-            <div className="space-y-3">
-              {status !== "live" ? (
-                <Button onClick={startMic}>🎤 Start live</Button>
-              ) : (
-                <Button className="bg-red-600 text-white" onClick={stopMic}>⏹ Stop</Button>
-              )}
-              <p className="text-xs text-neutral-500">{status === "live" ? "Mikrofonen er live. Brug headset for at undgå feedback." : "Mikrofonen er ikke aktiv endnu."}</p>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <input type="file" accept="audio/*" onChange={(e) => e.target.files && loadFile(e.target.files[0])} />
-              <div className="flex gap-2">
-                <Button onClick={playFile} disabled={!playerRef.current}>▶️ Afspil</Button>
-                <Button onClick={stopFile} disabled={!playerRef.current}>⏹ Stop</Button>
+            {sourceMode === "mic" ? (
+              <div className="space-y-3">
+                {/* Input source selector */}
+                <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+                  <label className="text-xs text-neutral-600 sm:w-32">Mikrofon-kilde</label>
+                  <select
+                    className="border rounded-xl px-3 py-2 flex-1"
+                    value={selectedMicId}
+                    onChange={(e) => setSelectedMicId(e.target.value)}
+                    onFocus={() => refreshMicDevices()}
+                  >
+                    <option value="">System standard</option>
+                    {micDevices.map((d, i) => (
+                      <option key={d.deviceId || i} value={d.deviceId}>
+                        {d.label || `Mikrofon ${i + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                  <Button className="px-3 py-2" onClick={refreshMicDevices}>Opdater enheder</Button>
+                </div>
+
+                {status !== "live" ? (
+                  <Button onClick={startMic}>🎤 Start live</Button>
+                ) : (
+                  <Button className="bg-red-600 text-white" onClick={stopMic}>⏹ Stop</Button>
+                )}
+                <p className="text-xs text-neutral-500">
+                  {status === "live" ? "Mikrofonen er live. Skift kilde fra listen ovenfor for at hoppe til en anden mikrofon." : "Vælg evt. mikrofon ovenfor og tryk ‘Start live’. Efter tilladelse vises enhedsnavne."}
+                </p>
               </div>
-              {fileName ? <p className="text-xs text-neutral-600">Valgt: {fileName} {status === "playing" && "(afspiller)"}</p> : <p className="text-xs text-neutral-500">Ingen fil valgt endnu.</p>}
-            </div>
-          )}
+            ) : (
+              <div className="space-y-3">
+                <input type="file" accept="audio/*" onChange={(e) => e.target.files && loadFile(e.target.files[0])} />
+                <div className="flex gap-2">
+                  <Button onClick={playFile} disabled={!playerRef.current}>▶️ Afspil</Button>
+                  <Button onClick={stopFile} disabled={!playerRef.current}>⏹ Stop</Button>
+                </div>
+                {fileName ? <p className="text-xs text-neutral-600">Valgt: {fileName} {status === "playing" && "(afspiller)"}</p> : <p className="text-xs text-neutral-500">Ingen fil valgt endnu.</p>}
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="space-y-4 p-4 rounded-2xl border bg-white">
@@ -379,8 +445,12 @@ export default function HarmonyLab() {
             </div>
           )}
           {downloadUrl && (
-            <a href={downloadUrl} download={`harmonylab-${Date.now()}.webm`} className="text-blue-600 underline">Download mix</a>
+            <div className="flex flex-col gap-2">
+              <a href={downloadUrl} download={`harmonylab-${Date.now()}.webm`} className="text-blue-600 underline">Download mix</a>
+              <audio ref={audioPreviewRef} src={downloadUrl || undefined} controls className="w-full max-w-md" />
+            </div>
           )}
+          <DevTests />
         </div>
         <div className="pt-2">
           <Toggle checked={muteDuringRec} onChange={setMuteDuringRec} label="Mute afspilning under optagelse (anti-feedback)" />
