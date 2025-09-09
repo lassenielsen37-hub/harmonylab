@@ -60,6 +60,7 @@ type Harmony = {
   gain: Tone.Gain;
   shifter: Tone.PitchShift;
   enabled: boolean;
+  prevLevel: number;
 };
 
 const HARMONY_PRESETS = [
@@ -101,6 +102,7 @@ export default function HarmonyLab() {
       gain: new Tone.Gain(0.7),
       shifter: new Tone.PitchShift({ pitch: p.semitones, windowSize: 0.1, delayTime: 0 }),
       enabled: p.id === "+3" || p.id === "+5",
+      prevLevel: 0.7,
     }));
   });
 
@@ -191,7 +193,7 @@ export default function HarmonyLab() {
   const loadFile = async (file: File) => {
     await initAudio(); const url = URL.createObjectURL(file); setFileName(file.name);
     if (playerRef.current) { try { detachNode(playerRef.current); playerRef.current.dispose(); } catch {} }
-    const player = new Tone.Player({ url, autostart: false, loop: false }).toDestination();
+    const player = new Tone.Player({ url, autostart: false, loop: false });
     playerRef.current = player; attachNode(player); setStatus("ready");
   };
   const playFile = async () => { if (!playerRef.current) return; await Tone.start(); playerRef.current.start(); setStatus("playing"); playerRef.current.onstop = () => setStatus("ready"); };
@@ -289,12 +291,61 @@ export default function HarmonyLab() {
   // Harmony toggles/levels
   const toggleHarmony = (id: string, on: boolean) => {
     setHarmonies((prev) => prev.map((h) => {
-      if (h.id === id) { if (!on) h.gain.gain.value = 0; return { ...h, enabled: on }; }
+      if (h.id === id) {
+        if (on) {
+          // Avoid mixing ?? and ||: compute robust fallback chain
+          const raw = h.prevLevel ?? Number(h.gain.gain.value);
+          const next = Number.isFinite(raw) ? (raw as number) : 0.7;
+          h.gain.gain.value = next;
+          return { ...h, enabled: true };
+        } else {
+          const current = Number(h.gain.gain.value);
+          h.gain.gain.value = 0;
+          return { ...h, enabled: false, prevLevel: Number.isFinite(current) ? current : h.prevLevel };
+        }
+      }
       return h;
     }));
   };
+
   const setHarmonyLevel = (id: string, level: number) => {
-    setHarmonies((prev) => prev.map((h) => { if (h.id === id) { h.gain.gain.value = level; return { ...h }; } return h; }));
+    setHarmonies((prev) => prev.map((h) => {
+      if (h.id === id) { h.gain.gain.value = level; return { ...h, prevLevel: level }; }
+      return h;
+    }));
+  };
+
+  // ============================== DEV TESTS ==============================
+  const DevTests: React.FC = () => {
+    const [result, setResult] = useState<string | null>(null);
+    const run = () => {
+      // Test 1: nullish + logical grouping equivalent
+      const a: number | undefined = undefined;
+      const b = 0; // valid 0 should be preserved when using our robust fallback
+      const raw = a ?? b;
+      const safe = Number.isFinite(raw) ? (raw as number) : 0.7; // should become 0, not 0.7
+
+      // Test 2: toggleHarmony semantics (mocked)
+      const h = { prevLevel: 0.6, value: 0 } as any;
+      const enable = () => {
+        const raw = h.prevLevel ?? h.value;
+        const next = Number.isFinite(raw) ? raw : 0.7;
+        h.value = next; h.enabled = true;
+      };
+      const disable = () => { h.prevLevel = h.value; h.value = 0; h.enabled = false; };
+
+      enable(); // -> value 0.6
+      disable(); // -> value 0
+      enable(); // -> value 0.6
+
+      setResult(JSON.stringify({ test1_safeFallbackIsZero: safe === 0, test2_toggle_cycle: { value: h.value, enabled: h.enabled } }, null, 2));
+    };
+    return (
+      <div className="mt-2 text-xs">
+        <Button onClick={run} className="px-2 py-1">Kør interne tests</Button>
+        {result && <pre className="mt-2 p-2 bg-neutral-100 rounded whitespace-pre-wrap">{result}</pre>}
+      </div>
+    );
   };
 
   // ============================== UI ==============================
@@ -389,6 +440,7 @@ export default function HarmonyLab() {
             </div>
           ))}
         </div>
+        <DevTests />
       </section>
 
       {/* 3) AFSPLILNING (optag/eksport og preview) */}
@@ -397,7 +449,7 @@ export default function HarmonyLab() {
           <h2 className="font-semibold">Afspilning & optagelse</h2>
           <Toggle checked={muteDuringRec} onChange={setMuteDuringRec} label="Mute afspilning under optag" />
         </div>
-        <p className="text-xs text-neutral-500">Når mute er slået til, sendes lyden stadig til optageren, men ikke til højttalerne.</p>
+        <p className="text-xs text-neutral-500">Når mute er slået til, sendes lyden stadig til optageren (inkl. harmonistemmer), men ikke til højttalerne.</p>
 
         <div className="flex flex-wrap gap-3 items-center">
           {!isRec ? (
